@@ -41,11 +41,17 @@ export function useP2PFileTransfer() {
   const socketRef = useRef<Socket | null>(null);
   const peerRef = useRef<SimplePeer.Instance | null>(null);
   const receivingFileRef = useRef<ReceivedFile | null>(null);
+
   const roleRef = useRef<Role | null>(null);
+  const roomIdRef = useRef<string>('');
 
   useEffect(() => {
     roleRef.current = role;
   }, [role]);
+
+  useEffect(() => {
+    roomIdRef.current = roomId;
+  }, [roomId]);
 
   const addLog = useCallback(
     (message: string, type: 'info' | 'success' | 'error' = 'info') => {
@@ -57,11 +63,13 @@ export function useP2PFileTransfer() {
 
   const createPeer = useCallback(
     (initiator: boolean) => {
+      const id = roomIdRef.current.trim();
+
       if (!socketRef.current) {
         addLog('Socket no inicializado', 'error');
         return;
       }
-      if (!roomId.trim()) {
+      if (!id) {
         addLog('roomId vacío. Crea o únete a una sala primero.', 'error');
         return;
       }
@@ -81,7 +89,7 @@ export function useP2PFileTransfer() {
 
       peer.on('signal', signal => {
         addLog('Enviando señal al otro peer...', 'info');
-        socketRef.current!.emit('signal', roomId, signal);
+        socketRef.current!.emit('signal', id, signal);
       });
 
       peer.on('connect', () => {
@@ -90,123 +98,116 @@ export function useP2PFileTransfer() {
       });
 
       peer.on('data', rawData => {
-  console.log('DATA RECIBIDA', rawData);
+        // igual que tu código actual, solo lo pego tal cual
+        console.log('DATA RECIBIDA', rawData);
 
-  // 1) Si viene como Uint8Array / ArrayBuffer, intentamos ver si es JSON
-  
+        if (rawData instanceof Uint8Array || rawData instanceof ArrayBuffer) {
+          const uint8 =
+            rawData instanceof Uint8Array
+              ? rawData
+              : new Uint8Array(rawData as ArrayBuffer);
 
-  if (rawData instanceof Uint8Array || rawData instanceof ArrayBuffer) {
-    const uint8 =
-      rawData instanceof Uint8Array
-        ? rawData
-        : new Uint8Array(rawData as ArrayBuffer);
+          const text = new TextDecoder().decode(uint8);
 
-    // Intentar decodificar como texto
-    const text = new TextDecoder().decode(uint8);
+          if (text.trim().startsWith('{') && text.trim().endsWith('}')) {
+            try {
+              console.log('DATA DECODIFICADA COMO TEXTO JSON', text);
+              const msg = JSON.parse(text);
 
-    // Si parece JSON (empieza por { y termina en }), lo tratamos como mensaje de control
-    if (text.trim().startsWith('{') && text.trim().endsWith('}')) {
-      try {
-        console.log('DATA DECODIFICADA COMO TEXTO JSON', text);
-        const msg = JSON.parse(text);
+              if (msg.type === 'file_start') {
+                const file: ReceivedFile = {
+                  fileName: msg.fileName,
+                  fileSize: msg.fileSize,
+                  chunks: [],
+                  totalReceived: 0,
+                };
+                receivingFileRef.current = file;
+                setShowReceiveProgress(true);
+                addLog(`Recibiendo archivo: ${msg.fileName}`, 'info');
+                return;
+              }
 
-        if (msg.type === 'file_start') {
-          const file: ReceivedFile = {
-            fileName: msg.fileName,
-            fileSize: msg.fileSize,
-            chunks: [],
-            totalReceived: 0,
-          };
-          receivingFileRef.current = file;
-          setShowReceiveProgress(true);
-          addLog(`Recibiendo archivo: ${msg.fileName}`, 'info');
-          return;
-        }
+              if (msg.type === 'file_complete') {
+                console.log('FILE_COMPLETE RECIBIDO', msg);
+                if (!receivingFileRef.current) return;
+                const file = receivingFileRef.current;
+                const blob = new Blob(file.chunks, {
+                  type: 'application/octet-stream',
+                });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = file.fileName;
+                a.click();
+                URL.revokeObjectURL(url);
+                setReceivedFiles(prev => [...prev, file]);
+                setShowReceiveProgress(false);
+                setReceiveProgress(0);
+                receivingFileRef.current = null;
+                addLog(`✓ Archivo recibido: ${file.fileName}`, 'success');
+                return;
+              }
+            } catch (e) {
+              console.error('Error parseando JSON de control', e, text);
+            }
+          }
 
-        if (msg.type === 'file_complete') {
-          console.log('FILE_COMPLETE RECIBIDO', msg);
+          // chunk binario
+          console.log('DATA ES BINARIO (chunk)', uint8);
           if (!receivingFileRef.current) return;
           const file = receivingFileRef.current;
-          const blob = new Blob(file.chunks, {
-            type: 'application/octet-stream',
-          });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = file.fileName;
-          a.click();
-          URL.revokeObjectURL(url);
-          setReceivedFiles(prev => [...prev, file]);
-          setShowReceiveProgress(false);
-          setReceiveProgress(0);
-          receivingFileRef.current = null;
-          addLog(`✓ Archivo recibido: ${file.fileName}`, 'success');
+          const arrayBuffer = uint8.buffer.slice(
+            uint8.byteOffset,
+            uint8.byteOffset + uint8.byteLength
+          ) as ArrayBuffer;
+          file.chunks.push(arrayBuffer);
+          file.totalReceived += uint8.byteLength;
+
+          const pct = Math.min(
+            Math.round((file.totalReceived / file.fileSize) * 100),
+            100
+          );
+          setReceiveProgress(pct);
           return;
         }
-      } catch (e) {
-        console.error('Error parseando JSON de control', e, text);
-        // si falla, seguimos tratándolo como binario normal
-      }
-    }
 
-    // Si llegamos aquí, lo tratamos como chunk binario de archivo
-    console.log('DATA ES BINARIO (chunk)', uint8);
-    if (!receivingFileRef.current) return;
-    const file = receivingFileRef.current;
-    const arrayBuffer = uint8.buffer.slice(
-  uint8.byteOffset,
-  uint8.byteOffset + uint8.byteLength
-) as ArrayBuffer;
-file.chunks.push(arrayBuffer);
-
-    const pct = Math.min(
-      Math.round((file.totalReceived / file.fileSize) * 100),
-      100
-    );
-    setReceiveProgress(pct);
-    return;
-  }
-
-  // 2) Por si algún navegador sí manda string puro
-  if (typeof rawData === 'string') {
-    console.log('DATA ES STRING', rawData);
-    try {
-      const msg = JSON.parse(rawData);
-      if (msg.type === 'file_start') {
-        const file: ReceivedFile = {
-          fileName: msg.fileName,
-          fileSize: msg.fileSize,
-          chunks: [],
-          totalReceived: 0,
-        };
-        receivingFileRef.current = file;
-        setShowReceiveProgress(true);
-        addLog(`Recibiendo archivo: ${msg.fileName}`, 'info');
-      } else if (msg.type === 'file_complete') {
-        if (!receivingFileRef.current) return;
-        const file = receivingFileRef.current;
-        const blob = new Blob(file.chunks, {
-          type: 'application/octet-stream',
-        });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = file.fileName;
-        a.click();
-        URL.revokeObjectURL(url);
-        setReceivedFiles(prev => [...prev, file]);
-        setShowReceiveProgress(false);
-        setReceiveProgress(0);
-        receivingFileRef.current = null;
-        addLog(`✓ Archivo recibido: ${file.fileName}`, 'success');
-      }
-    } catch (e) {
-      console.error('Error parseando string JSON', e, rawData);
-    }
-  }
-});
-
-
+        if (typeof rawData === 'string') {
+          console.log('DATA ES STRING', rawData);
+          try {
+            const msg = JSON.parse(rawData);
+            if (msg.type === 'file_start') {
+              const file: ReceivedFile = {
+                fileName: msg.fileName,
+                fileSize: msg.fileSize,
+                chunks: [],
+                totalReceived: 0,
+              };
+              receivingFileRef.current = file;
+              setShowReceiveProgress(true);
+              addLog(`Recibiendo archivo: ${msg.fileName}`, 'info');
+            } else if (msg.type === 'file_complete') {
+              if (!receivingFileRef.current) return;
+              const file = receivingFileRef.current;
+              const blob = new Blob(file.chunks, {
+                type: 'application/octet-stream',
+              });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = file.fileName;
+              a.click();
+              URL.revokeObjectURL(url);
+              setReceivedFiles(prev => [...prev, file]);
+              setShowReceiveProgress(false);
+              setReceiveProgress(0);
+              receivingFileRef.current = null;
+              addLog(`✓ Archivo recibido: ${file.fileName}`, 'success');
+            }
+          } catch (e) {
+            console.error('Error parseando string JSON', e, rawData);
+          }
+        }
+      });
 
       peer.on('close', () => {
         addLog('Conexión P2P cerrada', 'info');
@@ -218,10 +219,10 @@ file.chunks.push(arrayBuffer);
         addLog(`Error P2P: ${err.message}`, 'error');
       });
     },
-    [addLog, roomId]
+    [addLog]
   );
 
-  // Socket: se crea SOLO UNA VEZ
+  // Socket: se crea SOLO UNA VEZ (local)
   useEffect(() => {
     const socket = io('https://signaling-server-nf8c.onrender.com', { autoConnect: true });
     socketRef.current = socket;
@@ -244,6 +245,7 @@ file.chunks.push(arrayBuffer);
     });
 
     return () => {
+      socket.off();
       socket.disconnect();
     };
   }, [addLog, createPeer]);
@@ -261,9 +263,9 @@ file.chunks.push(arrayBuffer);
       alert('Ingresa el ID de la sala');
       return;
     }
-    socketRef.current?.emit('join', roomId);
+    socketRef.current?.emit('join', roomId.trim());
     setRole('receiver');
-    addLog(`Uniéndote a sala ${roomId} como receptor.`, 'success');
+    addLog(`Uniéndote a sala ${roomId.trim()} como receptor.`, 'success');
     createPeer(false);
   };
 
